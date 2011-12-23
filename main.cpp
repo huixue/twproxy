@@ -54,10 +54,12 @@
 #include "MyServerSocket.h"
 #include "HTTPRequest.h"
 #include "Cache.h"
+#include "dbg.h"
+#include "time.h"
 
 using namespace std;
 
-int serverPorts[] = {8080};
+int serverPorts[] = {8808, 8809, 8810};
 #define NUM_SERVERS (sizeof(serverPorts) / sizeof(serverPorts[0]))
 
 static string CONNECT_REPLY = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -71,10 +73,18 @@ struct client_struct {
     queue<MySocket *> *killQueue;
 };
 
+struct server_struct {
+    int serverPort;
+};
+
+pthread_t server_threads[NUM_SERVERS];
+static int gVOTING = 0;
+
 void run_client(MySocket *sock, int serverPort)
 {
     HTTPRequest *request = new HTTPRequest(sock, serverPort);
-
+    
+//    httpreq_dbg("%d: ", serverPort);
     if(!request->readRequest()) {
         cout << "did not read request" << endl;
     } else {    
@@ -84,24 +94,39 @@ void run_client(MySocket *sock, int serverPort)
         string host = request->getHost();
         string url = request->getUrl();
 
+        MySocket *replySock = NULL;
+        
         if(request->isConnect()) {
-            cerr << "connect request for " << host << " " << url << endl;
+                //deal with MITM in later patches
+            assert(false);
+//            cerr << serverPort << " connect request for " << host << " " << url << endl;
             if(!sock->write_bytes(CONNECT_REPLY)) {
                 error = true;
             } else {
                 delete request;
-                sock->enableSSLServer();
+                replySock = cache()->getReplySocket(host, true);
+                    //need proxy <--> remotesite socket for information needed to fake a certificate
+//                sock->enableSSLServer(replySock);
                 isSSL = true;
                 request = new HTTPRequest(sock, serverPort);
                 if(!request->readRequest()) {
                     error = true;
                 }
-            }
-        }
-
+            }            
+        } else
+            replySock = cache()->getReplySocket(host, false);
+        
         if(!error) {
             string req = request->getRequest();
-            cache()->getHTTPResponse(host, req, url, serverPort, sock, isSSL);
+            if(gVOTING == 0) {
+                cache()->getHTTPResponseNoVote(host, req, url, serverPort, sock, isSSL, replySock);
+            } else {
+//                if(isSSL == true)
+//                    cache()->getHTTPResponseVote(host, req, url, serverPort, sock, isSSL, replySock);
+//                else
+                    cache()->getHTTPResponseVote(host, req, url, serverPort, sock, isSSL, replySock);
+            }
+            
         }
     }    
 
@@ -109,14 +134,15 @@ void run_client(MySocket *sock, int serverPort)
     delete request;
 }
 
-void *client_thread(void *arg) {
+void *client_thread(void *arg)
+{
     struct client_struct *cs = (struct client_struct *) arg;
     MySocket *sock = cs->sock;
     int serverPort = cs->serverPort;
     queue<MySocket *> *killQueue = cs->killQueue;
 
     delete cs;
-
+    
     pthread_mutex_lock(&mutex);
     numThreads++;
     //cout << "numThread = " << numThreads << endl;
@@ -151,16 +177,23 @@ void start_client(MySocket *sock, int serverPort, queue<MySocket *> *killQueue)
     assert(ret == 0);
 }
 
-void start_server(int port)
+void *server_thread(void *arg)
 {
-    cerr << "starting server on port " << port << endl;
+    struct server_struct *ss = (struct server_struct *)arg;
+    int port = ss->serverPort;
+    delete ss;
     
     MyServerSocket *server = new MyServerSocket(port);
+    assert(server != NULL);
     MySocket *client;
     queue<MySocket *> killQueue;
-
     while(true) {
-        client = server->accept();
+        try {
+            client = server->accept();
+        } catch(MySocketException e) {
+            cerr << e.toString() << endl;
+            exit(1);
+        }
         pthread_mutex_lock(&mutex);
         while(killQueue.size() > 0) {
             delete killQueue.front();
@@ -168,12 +201,42 @@ void start_server(int port)
         }
         pthread_mutex_unlock(&mutex);
         start_client(client, port, &killQueue);
-    }
+    }    
+    return NULL;
 }
 
 
-int main(int /*argc*/, char */*argv*/[])
+pthread_t start_server(int port)
 {
+    cerr << "starting server on port " << port << endl;
+    server_struct *ss = new struct server_struct;
+    ss->serverPort = port;
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, server_thread, ss);
+    assert(ret == 0);
+    return tid;
+}
+
+static void get_opts(int argc, char *argv[])
+{
+    int c;
+    while((c = getopt(argc, argv, "v")) != EOF) {
+        switch(c) {
+            case 'v':
+                gVOTING = 1;
+                break;
+            default:
+                cerr << "Wrong Argument." << endl;
+                exit(1);
+                break;
+        }
+    }
+}
+int main(int argc, char *argv[])
+{
+        //if started with "-v" option, voting will be enabled. Otherwise, just a plain
+        //proxy
+    get_opts(argc, argv);  
     // get socket write errors from write call
     signal(SIGPIPE, SIG_IGN);
 
@@ -181,9 +244,22 @@ int main(int /*argc*/, char */*argv*/[])
     SSL_load_error_strings();
     SSL_library_init();
 
-    for(unsigned int idx = 0; idx < NUM_SERVERS; idx++) {
-        start_server(serverPorts[idx]);
-    }
+    cout << "number of servers: " << NUM_SERVERS << endl;
+
+        //when generating serial number for X509, need random number
+    srand(time(NULL));
+    Cache::setNumBrowsers(NUM_SERVERS);
     
+    pthread_t tid;
+    int ret;
+    for(unsigned int idx = 0; idx < NUM_SERVERS; idx++) {
+        tid = start_server(serverPorts[idx]);
+        server_threads[idx] = tid;
+    }
+
+    for(unsigned int idx = 0; idx < NUM_SERVERS; idx++) {
+        ret = pthread_join(server_threads[idx], NULL);
+        assert(ret == 0);
+    }
     return 0;
 }
